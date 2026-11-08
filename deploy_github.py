@@ -3,10 +3,12 @@
 """
 Sub4ch Checker — развёртывание в GitHub (один клик).
 
-Что делает: загружает программу (checker.py, sources.txt, workflow и т.д.)
-в репозиторий из config.ini. После этого проверка конфигов выполняется
-на серверах GitHub Actions КАЖДЫЕ 2 ЧАСА АВТОМАТИЧЕСКИ — без вашего
-компьютера и без Throne.
+Что делает: загружает программу (checker.py, sources.txt и т.д.)
+в репозиторий из config.ini.
+
+GitHub Actions отключены по решению владельца: после деплоя проверка
+запускается только локально (run_checker.bat на ПК, bash
+run_checker_mobile.sh в Termux).
 
 Токен берётся из config.ini ([github] token) или из переменной окружения
 GITHUB_TOKEN. Токену нужно право "Contents: Read and write"
@@ -32,7 +34,7 @@ except ImportError:
     sys.exit(1)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.1"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.3"
 
 # Файлы программы, которые публикуются в репозиторий.
 # config.ini, out/, bin/, .github/ — НЕ публикуются
