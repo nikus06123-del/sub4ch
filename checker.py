@@ -64,8 +64,8 @@ except ImportError:
 
 IS_WIN = platform.system() == "Windows"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.1"
-VERSION = "2.1"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.2"
+VERSION = "2.2"
 
 # Динамический список источников (обновляется сообществом; можно отключить в config.ini)
 DYNAMIC_URL_DEFAULT = (
@@ -1612,6 +1612,19 @@ def run_cycle(settings, args, cycle_no):
     with open(os.path.join(outdir, "sub_plain.txt"), "wb") as f:
         f.write(plain)
 
+    # Мобильная подписка: топ-N самых быстрых (список уже отсортирован по отклику).
+    # Мало серверов в файле = клиент на телефоне качает его быстрее и не тормозит.
+    mobile_b64 = mobile_plain = None
+    if settings.mobile_limit and uris:
+        m_uris = [c["uri"] for c in results[:settings.mobile_limit]]
+        mobile_plain = ("\n".join(m_uris) + "\n").encode("utf-8")
+        mobile_b64 = base64.b64encode(mobile_plain).decode("ascii").encode("ascii")
+        with open(os.path.join(outdir, os.path.basename(settings.path_mobile_b64)), "wb") as f:
+            f.write(mobile_b64)
+        with open(os.path.join(outdir, os.path.basename(settings.path_mobile_plain)), "wb") as f:
+            f.write(mobile_plain)
+        log(f"Мобильная подписка: {len(m_uris)} самых быстрых серверов")
+
     pushed = False
     elapsed = time.monotonic() - t0
     if uris:
@@ -1627,8 +1640,14 @@ def run_cycle(settings, args, cycle_no):
                 "tested": tested,
                 "live": len(uris),
                 "by_protocol": lh,
+                "mobile_limit": settings.mobile_limit,
+                "mobile_live": (min(len(uris), settings.mobile_limit)
+                                if settings.mobile_limit else None),
                 "elapsed_sec": round(elapsed)}
             files = {settings.path_b64: b64, settings.path_plain: plain}
+            if mobile_b64 is not None:
+                files[settings.path_mobile_b64] = mobile_b64
+                files[settings.path_mobile_plain] = mobile_plain
             if settings.path_stats:
                 files[settings.path_stats] = json.dumps(
                     stats_doc, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1639,6 +1658,9 @@ def run_cycle(settings, args, cycle_no):
                         f"https://raw.githubusercontent.com/{settings.repo}/{settings.branch}/{settings.path_b64}")
                     log(f"Зеркало (если raw недоступен): "
                         f"https://cdn.jsdelivr.net/gh/{settings.repo}@{settings.branch}/{settings.path_b64}")
+                    if mobile_b64 is not None:
+                        log(f"Мобильная подписка (топ-{settings.mobile_limit}): "
+                            f"https://raw.githubusercontent.com/{settings.repo}/{settings.branch}/{settings.path_mobile_b64}")
             except Exception as e:
                 log(f"Ошибка публикации на GitHub: {e}", "ERROR")
     else:
@@ -1678,6 +1700,9 @@ class Settings:
         self.path_b64 = (g("github", "path_base64", "sub.txt") or "").strip()
         self.path_plain = (g("github", "path_plain", "sub_plain.txt") or "").strip()
         self.path_stats = (g("github", "path_stats", "stats.json") or "").strip()
+        # отдельная «мобильная» подписка (топ самых быстрых серверов)
+        self.path_mobile_b64 = (g("github", "path_mobile_base64", "sub_mobile.txt") or "").strip()
+        self.path_mobile_plain = (g("github", "path_mobile_plain", "sub_mobile_plain.txt") or "").strip()
 
         # Динамические источники ([sources])
         self.dynamic_url = (g("sources", "dynamic_url", DYNAMIC_URL_DEFAULT) or "").strip()
@@ -1692,6 +1717,10 @@ class Settings:
         # лимит итоговой подписки (env CHECKER_MAX_RESULTS приоритетнее — для Actions)
         self.max_results = int(os.environ.get("CHECKER_MAX_RESULTS")
                                or g("checker", "max_results", "0") or 0)
+        # отдельная мобильная подписка: топ-N самых быстрых серверов в файл
+        # sub_mobile.txt (env CHECKER_MOBILE_LIMIT приоритетнее; 0 = не публиковать)
+        self.mobile_limit = int(os.environ.get("CHECKER_MOBILE_LIMIT")
+                                or g("checker", "mobile_limit", "0") or 0)
         self.out_dir = args.out_dir or (g("checker", "out_dir", "out") or "out")
         if not os.path.isabs(self.out_dir):
             self.out_dir = os.path.join(SCRIPT_DIR, self.out_dir)
