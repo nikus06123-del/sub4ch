@@ -23,7 +23,17 @@ set CHECKER_MAX_RUN=10000
 rem в подписку — только 500 самых быстрых
 set CHECKER_MAX_RESULTS=500
 
+rem Таймауты помягче: мобильная сеть медленнее домашней
+set CHECKER_TCP_TIMEOUT=4
+set CHECKER_CORE_TIMEOUT=6
+
+rem Пакетный режим v2.3: одно ядро на 50 конфигов — и быстрее,
+rem и легче по ОЗУ, чем 50 отдельных процессов
+set CHECKER_BATCH=1
+set CHECKER_BATCH_SIZE=50
+set CHECKER_BATCH_PARALLEL=1
+
 rem Один прогон и выход. Для регулярной проверки добавьте аргументы:
 rem   run_checker_mobile.bat --loop --interval 6   (каждые 6 часов)
-python checker.py --tcp-concurrency 500 --core-concurrency 50 %*
+python checker.py --tcp-concurrency 500 %*
 pause
