@@ -46,6 +46,8 @@ DEPLOY_FILES = [
     "run_checker.sh",
     "run_checker_mobile.bat",
     "run_checker_mobile.sh",
+    "install_vps.sh",
+    "config.ini.example",
     "README.md",
     ".github/workflows/update.yml",
 ]
