@@ -10,6 +10,16 @@ on:
         description: "Максимум конфигов на проверку за прогон (0 = без лимита)"
         required: false
         default: "0"
+  push:
+    # первый прогон срабатывает сразу после деплоя программы.
+    # Коммиты от встроенного GITHUB_TOKEN сами не запускают новые прогоны,
+    # так что зацикливания не будет.
+    branches: [main]
+    paths-ignore:
+      - sub.txt
+      - sub_plain.txt
+      - stats.json
+      - README.md
 
 permissions:
   contents: write
