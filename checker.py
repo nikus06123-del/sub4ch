@@ -1357,14 +1357,38 @@ def singbox_latest_tag(proxy):
     return r.json()["tag_name"]
 
 
+def _core_runs(path):
+    """Проверка, что ядро реально запускается.
+
+    Windows-антивирусы любят молча удалять или портить xray.exe/sing-box.exe —
+    файл есть, а работать нельзя. Без этой проверки программа качала ядро
+    заново каждый цикл.
+    """
+    try:
+        r = subprocess.run([path, "version"], capture_output=True, timeout=25)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def ensure_cores(settings):
     exes = {}
     cdir = settings.cores_dir
     os.makedirs(cdir, exist_ok=True)
     s, a = detect_platform()
     prx = (settings.http_proxy or "").strip() or None
+    AV_HINT = ("Ядро скачано, но не запускается — почти наверняка его удалил или "
+               "испортил АНТИВИРУС. Добавьте папку программы в исключения антивируса "
+               "(Безопасность Windows -> Защита от вирусов -> Исключения), иначе "
+               "ядро будет перекачиваться каждый цикл.")
     xname = "xray.exe" if IS_WIN else "xray"
     xpath = os.path.join(cdir, "xray", xname)
+    if os.path.isfile(xpath) and not _core_runs(xpath):
+        log(f"Xray: {AV_HINT}", "WARN")
+        try:
+            os.remove(xpath)
+        except OSError:
+            pass
     if not os.path.isfile(xpath):
         asset = XRAY_ASSETS.get((s, a))
         if not asset:
@@ -1381,6 +1405,12 @@ def ensure_cores(settings):
         exes["xray"] = xpath
     bname = "sing-box.exe" if IS_WIN else "sing-box"
     bpath = os.path.join(cdir, "sing-box", bname)
+    if os.path.isfile(bpath) and not _core_runs(bpath):
+        log(f"sing-box: {AV_HINT}", "WARN")
+        try:
+            os.remove(bpath)
+        except OSError:
+            pass
     if not os.path.isfile(bpath):
         try:
             log("Скачиваю ядро sing-box...")
