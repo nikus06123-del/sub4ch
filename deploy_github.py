@@ -35,7 +35,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.1"
 
 # Файлы программы, которые публикуются в репозиторий.
-# config.ini, out/, bin/ — НЕ публикуются (в config.ini живёт токен).
+# config.ini, out/, bin/, .github/ — НЕ публикуются
+# (в config.ini живёт токен; GitHub Actions отключены по решению владельца).
 DEPLOY_FILES = [
     ".gitignore",
     "requirements.txt",
@@ -49,7 +50,6 @@ DEPLOY_FILES = [
     "install_vps.sh",
     "config.ini.example",
     "README.md",
-    ".github/workflows/update.yml",
 ]
 
 TOKEN_HELP = """
@@ -164,22 +164,16 @@ def main():
 
     log(f"Готово: программа опубликована в {repo}")
     print()
-    print("=== ЧТО ДАЛЬШЕ ===")
-    print("1. Откройте вкладку Actions в репозитории (github.com/" + repo + "/actions).")
-    print("   Если Actions выключены — нажмите 'I understand my workflows, go ahead")
-    print("   and enable them'.")
-    print("2. Первый прогон:")
-    print("   - либо кнопкой: Actions -> Update VPN subscription -> Run workflow;")
-    print("   - либо сам запустится по расписанию (каждые 2 часа, UTC 0/2/4/...).")
-    print("3. Через 20-60 минут в репозитории появятся sub.txt / sub_plain.txt / stats.json.")
+    print("GitHub Actions отключены: подписка обновляется только при локальном")
+    print("запуске checker.py (на ПК, в Termux или на VPS).")
     print()
-    print("Ссылка для Throne (после первого прогона):")
+    print("Запуск на ПК:  run_checker.bat  (или python checker.py --loop)")
+    print("Запуск в Termux: bash run_checker_mobile.sh")
+    print()
+    print("Ссылки для Throne:")
     print(f"  https://raw.githubusercontent.com/{repo}/{branch}/sub.txt")
+    print(f"  Мобильная (топ-200): https://raw.githubusercontent.com/{repo}/{branch}/sub_mobile.txt")
     print(f"  Зеркало: https://cdn.jsdelivr.net/gh/{repo}@{branch}/sub.txt")
-    print()
-    print("Проверка теперь идёт на серверах GitHub каждые 2 часа — ваш компьютер")
-    print("не нужен. Локальный запуск (run_checker.bat) можно использовать, если")
-    print("важно отбирать серверы, живые именно у вашего провайдера.")
 
 
 if __name__ == "__main__":
