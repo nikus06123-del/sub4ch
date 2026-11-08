@@ -1689,7 +1689,9 @@ class Settings:
 
         self.interval_hours = float(g("checker", "interval_hours", "2") or 2)
         self.cap_per_endpoint = int(g("checker", "max_configs_per_endpoint", "20") or 0)
-        self.max_results = int(g("checker", "max_results", "0") or 0)
+        # лимит итоговой подписки (env CHECKER_MAX_RESULTS приоритетнее — для Actions)
+        self.max_results = int(os.environ.get("CHECKER_MAX_RESULTS")
+                               or g("checker", "max_results", "0") or 0)
         self.out_dir = args.out_dir or (g("checker", "out_dir", "out") or "out")
         if not os.path.isabs(self.out_dir):
             self.out_dir = os.path.join(SCRIPT_DIR, self.out_dir)
