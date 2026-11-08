@@ -1727,9 +1727,12 @@ class Settings:
         self.cores_dir = args.cores_dir or os.path.join(SCRIPT_DIR, "bin")
 
         self.tcp_concurrency = args.tcp_concurrency or int(g("testing", "tcp_concurrency", "1000") or 1000)
-        self.tcp_timeout = float(g("testing", "tcp_timeout", "4") or 4)
+        # таймауты можно перекрыть env CHECKER_TCP_TIMEOUT / CHECKER_CORE_TIMEOUT
+        self.tcp_timeout = float(os.environ.get("CHECKER_TCP_TIMEOUT")
+                                 or g("testing", "tcp_timeout", "4") or 4)
         self.core_concurrency = args.core_concurrency or int(g("testing", "core_concurrency", "100") or 100)
-        self.core_timeout = float(g("testing", "core_timeout", "10") or 10)
+        self.core_timeout = float(os.environ.get("CHECKER_CORE_TIMEOUT")
+                                  or g("testing", "core_timeout", "10") or 10)
         tu = (g("testing", "test_urls", DEFAULT_TEST_URLS) or DEFAULT_TEST_URLS)
         self.test_urls = [u.strip() for u in tu.split(",") if u.strip()]
         self.http_proxy = (os.environ.get("CHECKER_PROXY") or g("testing", "http_proxy", "") or "").strip()
