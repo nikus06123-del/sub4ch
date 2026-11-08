@@ -87,14 +87,18 @@ EOF
 fi
 
 # --- 6. Cron: каждые 2 часа ---
-CRON_LINE="0 */2 * * * cd $DIR && CHECKER_MAX_RUN=30000 $DIR/venv/bin/python checker.py >> $DIR/checker.log 2>&1"
+# Пакетный режим v2.3 в щадящих лимитах под VPS 1-2 ГБ ОЗУ:
+# 2 ядра × 100 конфигов = 200 проверок одновременно
+CRON_LINE="0 */2 * * * cd $DIR && CHECKER_MAX_RUN=0 CHECKER_BATCH=1 CHECKER_BATCH_SIZE=100 CHECKER_BATCH_PARALLEL=2 CHECKER_TCP_TIMEOUT=3 CHECKER_CORE_TIMEOUT=5 $DIR/venv/bin/python checker.py --tcp-concurrency 1500 >> $DIR/checker.log 2>&1"
 ( crontab -l 2>/dev/null | grep -v sub4ch-checker ; echo "$CRON_LINE # sub4ch-checker" ) | crontab -
 echo "Cron установлен: проверка каждые 2 часа (лог: $DIR/checker.log)"
 
 # --- 7. Первый прогон сейчас ---
-echo "Запускаю первый прогон (10-30 минут)..."
+echo "Запускаю первый прогон (5-15 минут)..."
 cd "$DIR"
-CHECKER_MAX_RUN=30000 venv/bin/python checker.py >> checker.log 2>&1 || true
+CHECKER_MAX_RUN=0 CHECKER_BATCH=1 CHECKER_BATCH_SIZE=100 CHECKER_BATCH_PARALLEL=2 \
+CHECKER_TCP_TIMEOUT=3 CHECKER_CORE_TIMEOUT=5 \
+venv/bin/python checker.py --tcp-concurrency 1500 >> checker.log 2>&1 || true
 tail -n 3 checker.log
 
 echo
