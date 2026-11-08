@@ -18,6 +18,8 @@ on:
     paths-ignore:
       - sub.txt
       - sub_plain.txt
+      - sub_mobile.txt
+      - sub_mobile_plain.txt
       - stats.json
       - README.md
 
@@ -55,6 +57,9 @@ jobs:
           # В подписку публикуются N самых быстрых серверов (сортировка по
           # отклику). 42k конфигов в файле тормозят клиент — 3000 достаточно.
           CHECKER_MAX_RESULTS: "3000"
+          # Отдельная мобильная подписка: топ-200 самых быстрых в sub_mobile.txt
+          # (меньше данных — клиент на телефоне качает и переключается быстрее)
+          CHECKER_MOBILE_LIMIT: "200"
         run: |
           python checker.py \
             --tcp-concurrency 1500 \
