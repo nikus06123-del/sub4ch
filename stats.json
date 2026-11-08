@@ -1,20 +1,20 @@
 {
-  "updated": "2026-11-08T00:55:05+00:00",
+  "updated": "2026-11-08T01:30:05+00:00",
   "version": "2.1",
   "sources_total": 145,
   "sources_ok": 137,
-  "raw_uris": 363432,
-  "unique_configs": 132883,
-  "tcp_alive": 56609,
-  "tested": 57333,
-  "live": 42472,
+  "raw_uris": 629810,
+  "unique_configs": 242936,
+  "tcp_alive": 40674,
+  "tested": 41095,
+  "live": 32622,
   "by_protocol": {
-    "hysteria2": 676,
-    "vmess": 9278,
-    "vless": 27968,
-    "ss": 310,
-    "trojan": 4232,
-    "tuic": 8
+    "hysteria2": 375,
+    "vless": 13923,
+    "vmess": 15783,
+    "ss": 168,
+    "trojan": 2364,
+    "tuic": 9
   },
-  "elapsed_sec": 1865
+  "elapsed_sec": 1740
 }
