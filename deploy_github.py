@@ -45,6 +45,7 @@ DEPLOY_FILES = [
     "deploy_github.py",
     "run_checker.bat",
     "run_checker.sh",
+    "run_checker_fast.bat",
     "run_checker_mobile.bat",
     "run_checker_mobile.sh",
     "install_vps.sh",
