@@ -210,6 +210,7 @@ sudo bash install_vps.sh --web --no-github
 | `requirements.txt` | зависимости (`requests`, `PySocks`, `PyYAML`) |
 | `.github/workflows/update.yml` | автопилот GitHub Actions: расписание, окружение, публикация |
 | `run_checker.bat` / `run_checker.sh` | запуск на Windows / Linux-macOS в режиме «каждые 2 часа» |
+| `run_checker_fast.bat` | ускоренный прогон (~3–5 мин вместо часа): выборка 8000 + таймауты 3/6 с + 2000/250 потоков под ПК с 16 ГБ ОЗУ |
 | `run_checker_mobile.bat` | проверка через мобильный интернет: ПК, подключённый к точке доступа телефона |
 | `run_checker_mobile.sh` | проверка через мобильный интернет прямо на Android (Termux) |
 | `install_vps.sh` | установка на VPS одной командой: cron каждые 2 ч + опционально раздача подписки через nginx |
