@@ -1,0 +1,20 @@
+{
+  "updated": "2026-11-08T00:09:48+00:00",
+  "version": "2.1",
+  "sources_total": 145,
+  "sources_ok": 138,
+  "raw_uris": 605903,
+  "unique_configs": 165231,
+  "tcp_alive": 1362,
+  "tested": 1384,
+  "live": 1008,
+  "by_protocol": {
+    "vless": 688,
+    "trojan": 99,
+    "vmess": 193,
+    "hysteria2": 21,
+    "ss": 6,
+    "tuic": 1
+  },
+  "elapsed_sec": 149
+}
