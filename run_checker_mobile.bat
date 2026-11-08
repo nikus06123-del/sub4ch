@@ -14,7 +14,8 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-python -m pip install -r requirements.txt --quiet --disable-pip-version-check
+rem Зависимости ставятся только если их ещё нет (не тормозит повторные запуски)
+python -c "import requests,socks,yaml" >nul 2>nul || python -m pip install -r requirements.txt --quiet --disable-pip-version-check
 
 rem --- Мобильные лимиты: экономим трафик и щадим сеть ---
 rem проверять не все конфиги (это сотни МБ), а случайную выборку
