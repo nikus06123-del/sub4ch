@@ -8,11 +8,14 @@ Sub4ch Checker — агрегатор и живой фильтр бесплат�
      автоопределение) + динамический список источников (обновляется сообществом).
   2. Парсит vless / vmess / trojan / ss / hysteria2 / tuic, дедуплицирует,
      ограничивает число конфигов на один адрес (IP:порт).
-  3. Ступень 1: асинхронный TCP-фильтр — отсекает адреса с закрытым портом.
+  3. Ступень 1: асинхронный TCP-фильтр — отсекает адреса с закрытым портом
+     (результат кешируется на адрес: соединение открываем один раз).
   4. Ступень 2: реальная проверка через ядра Xray (vless/vmess/trojan/ss) и
-     sing-box (hysteria2/tuic): поднимается локальный прокси-порт, через сервер
-     делается HTTP-запрос на 204-URL. Живут только те, кто реально отвечает.
-     Без Throne и без VPN-клиентов — свои собственные ядра.
+     sing-box (hysteria2/tuic) ПАЧКАМИ: один процесс ядра держит сразу ~200
+     локальных прокси-портов, каждый порт направляется через свой сервер,
+     через сервер делается HTTP-запрос на 204-URL. Живут только те, кто
+     реально отвечает. Если ядро отклоняет пачку — автоматический откат
+     на одиночную проверку. Без Throne и без VPN-клиентов — свои ядра.
   5. Живые конфиги сортируются по времени отклика и публикуются:
      - локально: out/sub.txt (base64) и out/sub_plain.txt
      - в GitHub-репозиторий через Contents API (sub.txt + sub_plain.txt + stats.json)
@@ -30,6 +33,7 @@ import asyncio
 import base64
 import binascii
 import configparser
+import ipaddress
 import json
 import os
 import platform
@@ -49,6 +53,7 @@ import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from itertools import islice
 
 try:
     import yaml  # PyYAML — для источников в формате Clash/mihomo YAML
@@ -64,8 +69,8 @@ except ImportError:
 
 IS_WIN = platform.system() == "Windows"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.2"
-VERSION = "2.2"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) sub4ch-checker/2.3"
+VERSION = "2.3"
 
 # Динамический список источников (обновляется сообществом; можно отключить в config.ini)
 DYNAMIC_URL_DEFAULT = (
@@ -1056,11 +1061,24 @@ def collect_configs(texts, settings):
 # --------------------------------------------------------- TCP-предфильтр ---
 
 async def tcp_prefilter(items, tcp_concurrency, tcp_timeout):
-    sem = asyncio.Semaphore(tcp_concurrency)
+    """Ступень 1: асинхронный TCP-фильтр — отсекает адреса с закрытым портом.
+
+    Оптимизации v2.3:
+      - окно задач вместо жёстких чанков: новое соединение стартует сразу,
+        как только освободилось место, без синхронных «ступенек»;
+      - результат кешируется на пару (host, порт): на одном адресе часто
+        сидит до 20 конфигов — соединение делаем один раз на всех.
+    """
+    if not items:
+        return {}
+    sem = asyncio.Semaphore(max(10, tcp_concurrency))
     loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=96)
+    dns_workers = int_try(os.environ.get("CHECKER_DNS_WORKERS")) or 256
+    executor = ThreadPoolExecutor(max_workers=dns_workers)
     loop.set_default_executor(executor)
     dns_cache = {}
+    ep_fut = {}
+    stat = {"alive": 0}
 
     def _resolve_sync(h):
         try:
@@ -1079,41 +1097,80 @@ async def tcp_prefilter(items, tcp_concurrency, tcp_timeout):
         dns_cache[h] = ip
         return ip
 
-    async def check(c):
-        async with sem:
-            h = c["host"]
-            ip = h if is_ip_literal(h) else await resolve(h)
-            if not ip:
-                c["_tcp"] = False
-                return
+    async def connect_probe(c):
+        h = c["host"]
+        ip = h if is_ip_literal(h) else await resolve(h)
+        if not ip:
+            return False
+        try:
+            _r, w = await asyncio.wait_for(
+                asyncio.open_connection(ip, c["port"]), tcp_timeout)
+            w.close()
             try:
-                _r, w = await asyncio.wait_for(
-                    asyncio.open_connection(ip, c["port"]), tcp_timeout)
-                w.close()
-                c["_tcp"] = True
-                try:
-                    await w.wait_closed()
-                except Exception:
-                    pass
+                await w.wait_closed()
             except Exception:
-                c["_tcp"] = False
+                pass
+            return True
+        except Exception:
+            return False
+
+    async def check(c):
+        ep = (c["host"], c["port"])
+        fut = ep_fut.get(ep)
+        if fut is None:
+            # первый конфиг адреса делает реальную проверку, остальные ждут
+            fut = loop.create_future()
+            ep_fut[ep] = fut
+            async with sem:
+                try:
+                    ok = await connect_probe(c)
+                except Exception:
+                    ok = False
+                if not fut.done():
+                    fut.set_result(ok)
+            if ok:
+                stat["alive"] += 1
+        try:
+            c["_tcp"] = await fut
+        except Exception:
+            c["_tcp"] = False
 
     total = len(items)
-    log(f"TCP-фильтр: {total} адресов, {tcp_concurrency} соединений одновременно", "TCP")
-    chunk = 500
+    unique = len({(c["host"], c["port"]) for c in items})
+    log(f"TCP-фильтр: {total} конфигов ({unique} уникальных адресов), "
+        f"{tcp_concurrency} соединений одновременно", "TCP")
+
+    pending = set()
+    it = iter(items)
+
+    def add_tasks(n):
+        for c in islice(it, n):
+            pending.add(asyncio.create_task(check(c)))
+
+    WINDOW = 4000
+    add_tasks(WINDOW)
+    done_total = 0
+    step = max(1, total // 12)
+    next_report = step
     try:
-        for i in range(0, total, chunk):
-            await asyncio.gather(*(check(c) for c in items[i:i + chunk]))
-            done = min(i + chunk, total)
-            alive = sum(1 for c in items[:done] if c["_tcp"])
-            log(f"  прогресс: {done}/{total} (живо {alive})", "TCP")
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            done_total += len(done)
+            for t in done:
+                if t.done() and not t.cancelled() and t.exception():
+                    t.exception()  # забираем, чтобы не сыпалось при GC
+            add_tasks(len(done))
+            if done_total >= next_report or done_total >= total:
+                log(f"  прогресс: {done_total}/{total} (живо {stat['alive']})", "TCP")
+                next_report += step
     finally:
         # освобождаем потоки — они понадобятся проверке через ядра
         executor.shutdown(wait=False)
     return dns_cache
 
 
-def resolve_hosts(items, workers=100):
+def resolve_hosts(items, workers=256):
     """Резолвит адреса (для sing-box: подставляем IP, SNI остаётся доменом)."""
     def res(c):
         if c.get("_rip"):
@@ -1143,6 +1200,61 @@ class ProxyNotReady(Exception):
     pass
 
 
+# кеш проверки «терпит ли ядро vless без TLS» (ключ — путь к бинарику)
+_VLESS_NONE_OK = {}
+
+# кеш проверки «отвергает ли xray allowInsecure» (новые версии его удалили)
+_XRAY_INSECURE_REJECT = {}
+
+
+def xray_rejects_insecure(exe):
+    """True, если этот бинарик xray уже не принимает allowInsecure=true.
+
+    Свежие Xray удалили эту опцию: конфиг с ней отвергается ЦЕЛИКОМ при
+    старте (exit 23). Такие конфиги направляем в sing-box, где insecure
+    по-прежнему поддерживается. Проверяем одним запуском, кешируем."""
+    if exe is None:
+        return False
+    cached = _XRAY_INSECURE_REJECT.get(exe)
+    if cached is not None:
+        return cached
+    out = {"protocol": "trojan", "tag": "probe",
+           "settings": {"servers": [{"address": "203.0.113.1", "port": 443,
+                                     "password": "probe", "level": 0}]},
+           "streamSettings": {"network": "tcp", "security": "tls",
+                              "tlsSettings": {"serverName": "probe.local",
+                                              "allowInsecure": True}}}
+    conf = {"log": {"loglevel": "error"}, "outbounds": [out]}
+    rejects = False
+    try:
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(conf, f)
+        flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
+        proc = subprocess.Popen([exe, "run", "-c", path],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=flags)
+        time.sleep(0.4)
+        rejects = proc.poll() is not None
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    except Exception:
+        rejects = False
+    _XRAY_INSECURE_REJECT[exe] = rejects
+    if rejects:
+        log("конфиги с allowInsecure=1 будут проверяться через sing-box "
+            "(этот Xray эту опцию больше не принимает)", "DBG")
+    return rejects
+
+
 def probe_via_proxy(port, test_urls, timeout):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({
         "http": f"http://127.0.0.1:{port}",
@@ -1160,8 +1272,14 @@ def probe_via_proxy(port, test_urls, timeout):
             r.close()
             if status in (200, 204):
                 return True, (time.monotonic() - t0) * 1000.0
-        except urllib.error.HTTPError:
-            # Ответ пришёл через туннель — сервер жив, просто код не 204/200
+        except urllib.error.HTTPError as e:
+            # 5xx — это ответ САМОГО ЯДРА «не смог дозвониться до сервера»
+            # (xray/sing-box так отвечают при неудачном dial), а не ответ
+            # удалённого сайта: сервер мёртв. Проверяем следующий URL.
+            if getattr(e, "code", 0) and e.code >= 500:
+                continue
+            # Ответ 2xx-4xx пришёл через туннель — сервер жив, просто код
+            # не 204/200 (например, 403 от самого сайта)
             return True, (time.monotonic() - t0) * 1000.0
         except urllib.error.URLError as e:
             if isinstance(getattr(e, "reason", None), (ConnectionRefusedError, FileNotFoundError)):
@@ -1210,6 +1328,60 @@ class TestCtx:
         with self._lock:
             if len(self.err_samples) < 3 and text:
                 self.err_samples.append(text[:400])
+
+    def release_ports(self, ports):
+        """Возвращает порты в пул после окончания теста (иначе набор
+        «использованных» растёт весь цикл и однажды кончается)."""
+        with self._lock:
+            for p in ports:
+                self._used.discard(p)
+
+    def allows_vless_none(self):
+        """Терпит ли ЭТОТ бинарик xray vless без TLS/reality.
+
+        Свежие Xray отвергают такой outbound целиком (exit 23, лог — в
+        stdout), и одна такая конфигурация убивала бы всю пачку. Зависит
+        от версии ядра, поэтому проверяем одним запуском и кешируем."""
+        exe = self.exes.get("xray")
+        if exe is None:
+            return True
+        cached = _VLESS_NONE_OK.get(exe)
+        if cached is not None:
+            return cached
+        out = {"protocol": "vless", "tag": "probe",
+               "settings": {"vnext": [{"address": "203.0.113.1", "port": 443,
+                                       "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                                                  "encryption": "none", "level": 0}]}]},
+               "streamSettings": {"network": "tcp"}}
+        conf = {"log": {"loglevel": "error"}, "outbounds": [out]}
+        ok = True
+        try:
+            fd, path = tempfile.mkstemp(suffix=".json", dir=self.tmpdir)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(conf, f)
+            flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
+            proc = subprocess.Popen([exe, "run", "-c", path],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    creationflags=flags, cwd=self.tmpdir)
+            time.sleep(0.4)
+            ok = proc.poll() is None
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        except Exception:
+            ok = True  # не смогли проверить — не выбрасываем конфиги зря
+        _VLESS_NONE_OK[exe] = ok
+        if not ok:
+            log("vless без TLS будет пропущен в пачках (это ядро такие "
+                "outbound-ы отвергает целиком)", "DBG")
+        return ok
 
 
 def core_test_one(c, core, ctx, keep_tmp=False):
@@ -1277,7 +1449,329 @@ def core_test_one(c, core, ctx, keep_tmp=False):
                     os.remove(fp)
                 except OSError:
                     pass
+        ctx.release_ports([port])
     return (status, c, lat)
+
+
+_PRIV4 = [ipaddress.ip_network(n) for n in
+          ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+_PRIV6 = [ipaddress.ip_network("fc00::/7")]
+
+
+def is_private_ip(host):
+    """Приватный/loopback адрес в понимании ядра Xray (семантика Go):
+    10/8, 172.16/12, 192.168/16, 127/8, fc00::/7, ::1.
+    Внимание: это НЕ python-овское is_private — TEST-NET-диапазоны
+    (203.0.113.x и т.п.) для ядра ПУБЛИЧНЫЕ. Домен — тоже не исключение:
+    ядро резолвит его и отвергает, если там публичный IP."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # домен
+    nets = _PRIV4 if ip.version == 4 else _PRIV6
+    return ip.is_loopback or any(ip in n for n in nets)
+
+
+# ------------------------------------------------- пачечная проверка (v2.3) --
+
+# Шифры shadowsocks, которые ядро принимает при старте (классический AEAD).
+# Легаси-шифры (rc4, cfb, ctr...) и SS2022 с невалидным ключом новые ядра
+# отвергают ЦЕЛИКОМ (exit 23 при старте) — одна такая конфигурация валит
+# всю пачку, поэтому в пачки их не берём (в одиночном режиме они просто
+# получат fail, как и в v2.2).
+SS_BATCH_CIPHERS = {
+    "aes-128-gcm", "aes-256-gcm",
+    "chacha20-poly1305", "chacha20-ietf-poly1305",
+    "xchacha20-poly1305", "xchacha20-ietf-poly1305",
+}
+
+
+def build_batch_config_xray(entries):
+    """Один конфиг Xray сразу на всю пачку: каждому конфигу — свой входящий
+    HTTP-порт и свой outbound, маршрутизация inbound -> outbound."""
+    inbounds, outbounds, rules = [], [], []
+    outbounds.append({"protocol": "freedom", "tag": "direct"})
+    for j, (_i, _c, out, port) in enumerate(entries):
+        out["tag"] = f"out{j}"
+        outbounds.append(out)  # без этого пачка проверяла бы не тех серверов!
+        inbounds.append({"listen": "127.0.0.1", "port": port,
+                         "protocol": "http", "tag": f"in{j}"})
+        # ВАЖНО: у правил маршрутизации Xray обязательно "type": "field" —
+        # без него ядро молча игнорирует правило, и трафик уходит в
+        # outbound по умолчанию (мимо проверяемого сервера!)
+        rules.append({"type": "field",
+                      "inboundTag": [f"in{j}"], "outboundTag": f"out{j}"})
+    return {"log": {"loglevel": "error"}, "inbounds": inbounds,
+            "outbounds": outbounds,
+            "routing": {"domainStrategy": "AsIs", "rules": rules}}
+
+
+def build_batch_config_sb(entries):
+    """То же для sing-box (hysteria2/tuic): входящие mixed + правила маршрутов."""
+    inbounds, outbounds, rules = [], [], []
+    for j, (_i, _c, out, port) in enumerate(entries):
+        out["tag"] = f"out{j}"
+        outbounds.append(out)
+        inbounds.append({"type": "mixed", "tag": f"in{j}",
+                         "listen": "127.0.0.1", "listen_port": port})
+        rules.append({"inbound": [f"in{j}"], "outbound": f"out{j}"})
+    return {"log": {"level": "error"}, "inbounds": inbounds,
+            "outbounds": outbounds, "route": {"rules": rules}}
+
+
+def batch_probe(port, ctx, proc, deadline):
+    """Опрос одного порта пачки, пока ядро живо и не вышел дедлайн."""
+    while True:
+        if proc.poll() is not None:
+            return "dead", None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "fail", None
+        try:
+            ok, lat = probe_via_proxy(port, ctx.test_urls,
+                                      min(remaining, ctx.core_timeout))
+            return ("ok" if ok else "fail"), lat
+        except ProxyNotReady:
+            time.sleep(0.2)
+
+
+def _batch_run_once(entries, core, ctx, keep_tmp):
+    """Один запуск ядра на пачку entries=[(orig_i, c, out, port)].
+
+    Возвращает {orig_i: (status, latency)} либо None, если ядро не приняло
+    пачку (отклонила конфигурация / процесс умер) — вызывающий код
+    раздробит пачку, чтобы изолировать «ядовитые» конфиги.
+    """
+    ports = [e[3] for e in entries]
+    builder = build_batch_config_xray if core == "xray" else build_batch_config_sb
+    conf = builder(entries)
+    idx = ctx.next_id()
+    cfg_path = os.path.join(ctx.tmpdir, f"b{idx}.json")
+    err_path = cfg_path + ".err"
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(conf, f, ensure_ascii=False)
+    except Exception:
+        ctx.release_ports(ports)
+        return None
+    exe = ctx.exes[core]
+    flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
+    proc = None
+    errf = None
+    try:
+        errf = open(err_path, "wb")
+        # логи ядро пишет в stdout («Failed to start» — именно там),
+        # поэтому собираем оба потока в один файл
+        proc = subprocess.Popen([exe, "run", "-c", cfg_path],
+                                stdout=errf, stderr=errf,
+                                creationflags=flags, cwd=ctx.tmpdir)
+        errf.close()
+        errf = None
+        time.sleep(0.35)  # даём ядру стартовать
+        if proc.poll() is not None:
+            et = ""
+            try:
+                with open(err_path, "rb") as f:
+                    et = f.read(8192).decode("utf-8", "ignore")
+            except OSError:
+                pass
+            err_line = ""
+            for line in et.splitlines():
+                if "Failed to start" in line or "FATAL" in line:
+                    err_line = line.strip()  # последняя настоящая причина
+            if not err_line and et:
+                err_line = et.splitlines()[-1].strip()
+            ctx.add_err_sample(f"пачка {core} x{len(entries)} отклонена: "
+                               f"{err_line[:220] or 'процесс умер сразу'}")
+            return None
+        deadline = time.monotonic() + ctx.core_timeout + 2.0
+        dead = False
+        res = {}
+        with ThreadPoolExecutor(max_workers=len(entries)) as pp:
+            futs = [pp.submit(batch_probe, e[3], ctx, proc, deadline)
+                    for e in entries]
+            for j, f in enumerate(futs):
+                st, lat = f.result()
+                if st == "dead":
+                    dead = True
+                res[entries[j][0]] = (("ok" if st == "ok" else "fail"), lat)
+        if dead and proc.poll() is not None:
+            return None  # ядро умерло посреди пачки — раздробим
+        return res
+    except Exception:
+        return None
+    finally:
+        if errf is not None:
+            try:
+                errf.close()
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        ctx.release_ports(ports)
+        if not keep_tmp:
+            for fp in (cfg_path, err_path):
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+
+
+def batch_test_group(group, core, ctx, keep_tmp=False):
+    """Проверка пачки конфигов ОДНИМ процессом ядра (v2.3).
+
+    Вместо «один процесс на конфиг» строится общий конфиг: у каждого
+    конфига свой локальный порт и свой outbound. Возвращаем список
+    (status, latency) по каждому конфигу группы либо None, если проверить
+    не удалось ни одного конфига (тогда вызывающий код идёт по-одиночке).
+
+    Если ядро отвергает пачку целиком (одна кривая конфигурация валит
+    весь запуск), пачка дробится пополам — «ядовитый» конфиг изолируется
+    за ~log2(N) запусков и не топит соседей. Конфигурации, которые ядро
+    не принимает в принципе, остаются unsupported: живыми они быть не могут.
+    """
+    results = [("unsupported", None)] * len(group)
+
+    def run(items, depth):
+        # items: [(orig_i, config)]
+        entries = []
+        for i, c in items:
+            if core == "xray" and c.get("insecure") \
+                    and xray_rejects_insecure(ctx.exes.get("xray")):
+                # этот Xray отвергает allowInsecure (вся пачка умрёт);
+                # конфиг ушёл в группу sing-box (или будет пропущен)
+                continue
+            if c.get("scheme") == "ss" \
+                    and (c.get("method") or "").lower().replace("_", "-") \
+                    not in SS_BATCH_CIPHERS:
+                # легаси/нестандартный шифр — ядро отвергнет всю пачку
+                continue
+            if core == "xray" and c.get("scheme") == "vless" \
+                    and (c.get("security") or "none") == "none" \
+                    and not is_private_ip(c.get("host") or "") \
+                    and not ctx.allows_vless_none():
+                # это ядро отвергает vless без TLS/reality на публичный
+                # адрес (exit 23) — такая конфигурация убила бы всю пачку.
+                # На приватные адреса (127.x, 192.168.x) ядро соглашается.
+                continue
+            out = xray_outbound(c) if core == "xray" else sb_outbound(c)
+            if out is None:
+                continue
+            entries.append((i, c, out, ctx.take_port()))
+        if not entries:
+            return
+        res = _batch_run_once(entries, core, ctx, keep_tmp)
+        if res is not None:
+            for i, val in res.items():
+                results[i] = val
+            return
+        if len(items) > 8 and depth < 8:
+            mid = len(items) // 2
+            run(items[:mid], depth + 1)
+            run(items[mid:], depth + 1)
+
+    run(list(enumerate(group)), 0)
+    if all(st == "unsupported" for st, _ in results):
+        return None  # ни один конфиг не проверен — работает одиночный режим
+    return results
+
+
+def _test_group_single(core, group, ctx, concurrency, keep_tmp, collect, results):
+    """Старая схема: один процесс ядра на каждый конфиг (fallback)."""
+    base = len(results)
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futs = []
+        inline = False
+        for c in group:
+            if inline:
+                st, cc, lt = core_test_one(c, core, ctx, keep_tmp)
+                collect(st, cc, lt)
+                continue
+            try:
+                futs.append(pool.submit(core_test_one, c, core, ctx, keep_tmp))
+            except RuntimeError:
+                # системы с жёстким лимитом потоков — деградируем
+                inline = True
+                log(f"  {core}: лимит потоков ОС, часть проверок идёт "
+                    f"последовательно", "WARN")
+                st, cc, lt = core_test_one(c, core, ctx, keep_tmp)
+                collect(st, cc, lt)
+        for i, fut in enumerate(as_completed(futs), 1):
+            st, cc, lt = fut.result()
+            collect(st, cc, lt)
+            if i % 200 == 0 or i == len(futs):
+                log(f"  {core}: {i}/{len(group)} (живых {len(results) - base})")
+
+
+def test_group(core, group, ctx, settings, keep_tmp, collect, results):
+    """Проверка группы конфигов выбранным режимом.
+
+    Пакетный (v2.3): одно ядро обслуживает сразу batch_size конфигов —
+    на порядок быстрее и в разы экономнее по ОЗУ. Если ядро отклоняет
+    пачку, она автоматически проверяется по-одиночке; после 5 неудач
+    пакетный режим отключается до конца цикла.
+    """
+    base = len(results)
+    total = len(group)
+    if not settings.batch_mode:
+        log(f"  {core}: одиночная проверка, {settings.core_concurrency} потоков")
+        _test_group_single(core, group, ctx, settings.core_concurrency,
+                           keep_tmp, collect, results)
+        return
+
+    bs = max(10, settings.batch_size)
+    batches = [group[i:i + bs] for i in range(0, total, bs)]
+    log(f"  {core}: пачками по {bs} конфигов, "
+        f"{settings.batch_parallel} ядер одновременно")
+    state = {"fail": 0, "done": 0, "off": False}
+    lock = threading.Lock()
+
+    def one_batch(batch):
+        try:
+            res = None
+            with lock:
+                off = state["off"]
+            if not off:
+                res = batch_test_group(batch, core, ctx, keep_tmp)
+            if res is None:
+                with lock:
+                    state["fail"] += 1
+                    if state["fail"] >= 5:
+                        state["off"] = True
+                log(f"  {core}: пачка не прошла через ядро — проверяю по-одиночке "
+                    f"({state['fail']}-й сбой)", "WARN")
+                with ThreadPoolExecutor(max_workers=min(24, max(1, len(batch)))) as fp:
+                    futs = [fp.submit(core_test_one, c, core, ctx, keep_tmp)
+                            for c in batch]
+                    for f in as_completed(futs):
+                        st, cc, lt = f.result()
+                        collect(st, cc, lt)
+            else:
+                for (st, lt), c in zip(res, batch):
+                    collect(st, c, lt)
+            with lock:
+                state["done"] += 1
+                d = state["done"]
+            if d % 5 == 0 or d == len(batches):
+                log(f"  {core}: пачек {d}/{len(batches)} "
+                    f"(живых {len(results) - base})")
+        except Exception as e:
+            log(f"  {core}: сбой пачки: {e}", "WARN")
+
+    with ThreadPoolExecutor(max_workers=max(1, settings.batch_parallel)) as bp:
+        futs = [bp.submit(one_batch, b) for b in batches]
+        for f in as_completed(futs):
+            f.result()
 
 
 def download_file(url, proxy, retries=3):
@@ -1558,6 +2052,11 @@ def run_cycle(settings, args, cycle_no):
             def core_for(c):
                 if c["scheme"] in UDP_SCHEMES:
                     return "singbox" if "singbox" in exes else None
+                # свежие Xray не принимают allowInsecure — такие конфиги
+                # проверяем через sing-box, где insecure ещё поддерживается
+                if c.get("insecure") and "singbox" in exes \
+                        and xray_rejects_insecure(exes.get("xray")):
+                    return "singbox"
                 if "xray" in exes:
                     return "xray"
                 return "singbox" if "singbox" in exes else None
@@ -1570,6 +2069,15 @@ def run_cycle(settings, args, cycle_no):
             tested = sum(len(g) for g in groups.values())
             tmpdir = tempfile.mkdtemp(prefix="sub4ch_")
             try:
+                okc = 0
+
+                def collect(st, cc, lt):
+                    nonlocal okc
+                    if st == "ok":
+                        okc += 1
+                        cc["_lat"] = lt
+                        results.append(cc)
+
                 for core, group in groups.items():
                     if not group:
                         continue
@@ -1578,39 +2086,9 @@ def run_cycle(settings, args, cycle_no):
                         if not group:
                             continue
                     ctx = TestCtx(exes, tmpdir, settings.test_urls, settings.core_timeout)
-                    log(f"Проверка через {core}: {len(group)} конфигов, "
-                        f"{settings.core_concurrency} потоков")
-                    okc = 0
-
-                    def collect(st, cc, lt):
-                        nonlocal okc
-                        if st == "ok":
-                            okc += 1
-                            cc["_lat"] = lt
-                            results.append(cc)
-
-                    with ThreadPoolExecutor(max_workers=settings.core_concurrency) as pool:
-                        futs = []
-                        inline = False
-                        for c in group:
-                            if inline:
-                                st, cc, lt = core_test_one(c, core, ctx, args.keep_tmp)
-                                collect(st, cc, lt)
-                                continue
-                            try:
-                                futs.append(pool.submit(core_test_one, c, core, ctx, args.keep_tmp))
-                            except RuntimeError:
-                                # системы с жёстким лимитом потоков — деградируем
-                                inline = True
-                                log(f"  {core}: лимит потоков ОС, часть проверок идёт "
-                                    f"последовательно", "WARN")
-                                st, cc, lt = core_test_one(c, core, ctx, args.keep_tmp)
-                                collect(st, cc, lt)
-                        for i, fut in enumerate(as_completed(futs), 1):
-                            st, cc, lt = fut.result()
-                            collect(st, cc, lt)
-                            if i % 200 == 0 or i == len(futs):
-                                log(f"  {core}: {i}/{len(group)} (живых {okc})")
+                    log(f"Проверка через {core}: {len(group)} конфигов")
+                    test_group(core, group, ctx, settings, args.keep_tmp,
+                               collect, results)
                     for smp in ctx.err_samples:
                         log(f"  пример ошибки: {smp}", "DBG")
             finally:
@@ -1668,6 +2146,7 @@ def run_cycle(settings, args, cycle_no):
                 "unique_configs": items_total,
                 "tcp_alive": len(tcp_alive),
                 "tested": tested,
+                "test_mode": ("batch" if settings.batch_mode else "single"),
                 "live": len(uris),
                 "by_protocol": lh,
                 "mobile_limit": settings.mobile_limit,
@@ -1763,6 +2242,15 @@ class Settings:
         self.core_concurrency = args.core_concurrency or int(g("testing", "core_concurrency", "100") or 100)
         self.core_timeout = float(os.environ.get("CHECKER_CORE_TIMEOUT")
                                   or g("testing", "core_timeout", "10") or 10)
+        # Пакетный режим (v2.3): одно ядро проверяет сразу пачку конфигов через
+        # отдельные локальные порты — ступень 2 ускоряется на порядок.
+        # CHECKER_BATCH=0 возвращает старую схему «один процесс на конфиг».
+        self.batch_mode = truthy(os.environ.get("CHECKER_BATCH")
+                                 or g("testing", "batch", "1"))
+        self.batch_size = int(os.environ.get("CHECKER_BATCH_SIZE")
+                              or g("testing", "batch_size", "200") or 200)
+        self.batch_parallel = int(os.environ.get("CHECKER_BATCH_PARALLEL")
+                                  or g("testing", "batch_parallel", "6") or 6)
         tu = (g("testing", "test_urls", DEFAULT_TEST_URLS) or DEFAULT_TEST_URLS)
         self.test_urls = [u.strip() for u in tu.split(",") if u.strip()]
         self.http_proxy = (os.environ.get("CHECKER_PROXY") or g("testing", "http_proxy", "") or "").strip()
