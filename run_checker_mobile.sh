@@ -34,9 +34,17 @@ command -v termux-wake-lock   >/dev/null 2>&1 && termux-wake-lock
 # --- Мобильные лимиты: экономим трафик и батарею ---
 export CHECKER_MAX_RUN=6000      # случайная выборка 6000 конфигов вместо всех
 export CHECKER_MAX_RESULTS=500   # в подписку — 500 самых быстрых
+export CHECKER_TCP_TIMEOUT=4     # мобильная сеть медленнее домашней
+export CHECKER_CORE_TIMEOUT=6
+
+# Пакетный режим v2.3: одно ядро на 50 конфигов — быстрее и легче по ОЗУ,
+# чем 50 отдельных процессов на телефоне
+export CHECKER_BATCH=1
+export CHECKER_BATCH_SIZE=50
+export CHECKER_BATCH_PARALLEL=1
 
 # Один прогон и выход. Регулярно (каждые 6 часов):
 #   bash run_checker_mobile.sh --loop --interval 6
-python3 checker.py --tcp-concurrency 300 --core-concurrency 25 "$@"
+python3 checker.py --tcp-concurrency 300 "$@"
 
 command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
